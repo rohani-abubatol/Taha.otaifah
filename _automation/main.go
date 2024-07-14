@@ -27,8 +27,9 @@ func init() {
 const grammarsJson = "./_automation/grammars.json"
 
 type GrammarVersion struct {
-	Reference string `json:"reference"`
-	Revision  string `json:"revision"`
+	Reference      string `json:"reference"`
+	Revision       string `json:"revision"`
+	UpdatedBasedOn string `json:"updateBasedOn"` //"tag" or "commit". If not defined, "commit" is default
 }
 
 type Grammar struct {
@@ -46,7 +47,7 @@ func (g *Grammar) ContentURL() string {
 }
 
 func (g *Grammar) FetchNewVersion() *GrammarVersion {
-	if strings.HasPrefix(g.Reference, "v") {
+	if strings.EqualFold(g.UpdatedBasedOn, "tag") {
 		tag, rev := fetchLastTag(g.URL)
 		if tag != g.Reference {
 			return &GrammarVersion{
@@ -236,6 +237,12 @@ func (s *UpdateService) downloadGrammar(ctx context.Context, g *Grammar) {
 		s.downloadTypescript(ctx, g)
 	case "yaml":
 		s.downloadYaml(ctx, g)
+	case "php":
+		s.downloadPhp(ctx, g)
+	case "markdown":
+		s.downloadMarkdown(ctx, g)
+	case "sql":
+		s.downloadSql(ctx, g)
 	default:
 		s.defaultGrammarDownload(ctx, g)
 	}
@@ -268,6 +275,10 @@ func (s *UpdateService) defaultGrammarDownload(ctx context.Context, g *Grammar) 
 			map[string]string{
 				`<tree_sitter/parser.h>`: `"parser.h"`,
 				`"tree_sitter/parser.h"`: `"parser.h"`,
+				`"tree_sitter/array.h"`:  `"../array.h"`,
+				`<tree_sitter/array.h>`:  `"../array.h"`,
+				`"tree_sitter/alloc.h"`:  `"../alloc.h"`,
+				`<tree_sitter/alloc.h>`:  `"../alloc.h"`,
 			},
 		)
 	}
@@ -315,6 +326,44 @@ func (s *UpdateService) writeGrammarsFile(ctx context.Context) {
 	err = os.WriteFile(grammarsJson, b, 0644)
 	if err != nil {
 		logAndExit(getLogger(ctx), err.Error(), "file", grammarsJson)
+	}
+}
+
+func (s *UpdateService) downloadPhp(ctx context.Context, g *Grammar) {
+	fileMapping := map[string]string{
+		"parser.c":  "php/src/parser.c",
+		"scanner.c": "php/src/scanner.c",
+		"scanner.h": "common/scanner.h",
+	}
+
+	url := g.ContentURL()
+
+	treeSitterFiles := []string{"parser.h", "array.h", "alloc.h"}
+
+	for _, f := range treeSitterFiles {
+		s.downloadFile(
+			ctx,
+			fmt.Sprintf("%s/%s/php/src/tree_sitter/%s", url, g.Revision, f),
+			fmt.Sprintf("%s/tree_sitter/%s", g.Language, f),
+			nil,
+		)
+	}
+
+	for _, f := range g.Files {
+		fp, ok := fileMapping[f]
+		if !ok {
+			logAndExit(getLogger(ctx), "mapping for file not found", "file", f)
+		}
+
+		s.downloadFile(
+			ctx,
+			fmt.Sprintf("%s/%s/%s", url, g.Revision, fp),
+			fmt.Sprintf("%s/%s", g.Language, f),
+			map[string]string{
+				`<tree_sitter/parser.h>`:   `"parser.h"`,
+				`"../../common/scanner.h"`: `"scanner.h"`,
+			},
+		)
 	}
 }
 
@@ -389,6 +438,34 @@ func (s *UpdateService) downloadTypescript(ctx context.Context, g *Grammar) {
 	}
 }
 
+// markdown is special as it contains 2 different grammars
+func (s *UpdateService) downloadMarkdown(ctx context.Context, g *Grammar) {
+	url := g.ContentURL()
+
+	langs := []string{"tree-sitter-markdown", "tree-sitter-markdown-inline"}
+	for _, lang := range langs {
+		s.makeDir(ctx, fmt.Sprintf("%s/%s", g.Language, lang))
+
+		s.downloadFile(
+			ctx,
+			fmt.Sprintf("%s/%s/%s/src/tree_sitter/parser.h", url, g.Revision, lang),
+			fmt.Sprintf("%s/%s/parser.h", g.Language, lang),
+			nil,
+		)
+
+		for _, f := range g.Files {
+			s.downloadFile(
+				ctx,
+				fmt.Sprintf("%s/%s/%s/src/%s", url, g.Revision, lang, f),
+				fmt.Sprintf("%s/%s/%s", g.Language, lang, f),
+				map[string]string{
+					`"tree_sitter/parser.h"`: `"parser.h"`,
+				},
+			)
+		}
+	}
+}
+
 // for yaml grammar scanner.cc includes schema.generated.cc file
 // it causes cgo to compile schema.generated.cc twice and throw duplicate symbols error
 func (s *UpdateService) downloadYaml(ctx context.Context, g *Grammar) {
@@ -413,6 +490,32 @@ func (s *UpdateService) downloadYaml(ctx context.Context, g *Grammar) {
 	_ = os.WriteFile(fmt.Sprintf("%s/scanner.cc", g.Language), b, 0644)
 }
 
+// sql is special since its folder structure is different from the other ones
+func (s *UpdateService) downloadSql(ctx context.Context, g *Grammar) {
+	fileMapping := map[string]string{
+		"parser.h":  "tree_sitter/parser.h",
+		"scanner.c": "scanner.c",
+		"parser.c":  "parser.c",
+	}
+
+	s.makeDir(ctx, fmt.Sprintf("%s/tree_sitter", g.Language))
+
+	url := g.ContentURL()
+	for _, f := range g.Files {
+		fp, ok := fileMapping[f]
+		if !ok {
+			logAndExit(getLogger(ctx), "mapping for file not found", "file", f)
+		}
+
+		s.downloadFile(
+			ctx,
+			fmt.Sprintf("%s/%s/src/%s", url, g.Revision, fp),
+			fmt.Sprintf("%s/%s", g.Language, fp),
+			nil,
+		)
+	}
+}
+
 func logAndExit(logger *Logger, msg string, args ...interface{}) {
 	logger.Error(msg, args...)
 	os.Exit(1)
@@ -421,15 +524,28 @@ func logAndExit(logger *Logger, msg string, args ...interface{}) {
 // Git
 
 func fetchLastTag(repository string) (string, string) {
-	cmd := exec.Command("git", "ls-remote", "--tags", "--refs", "--sort", "-v:refname", repository, "v*")
+	cmd := exec.Command("git", "ls-remote", "--tags", "--sort", "-v:refname", repository, "v*")
 	b, err := cmd.Output()
 	if err != nil {
 		logAndExit(defaultLogger, err.Error())
 	}
 	line := strings.SplitN(string(b), "\n", 2)[0]
+
+	//handle situation when nothing is returned because tag doesn't start with `v`
+	if len(line) < 1 {
+		cmd := exec.Command("git", "ls-remote", "--tags", "--sort", "-v:refname", repository)
+		b, err := cmd.Output()
+		if err != nil {
+			logAndExit(defaultLogger, err.Error())
+		}
+		line = strings.SplitN(string(b), "\n", 2)[0]
+	}
 	parts := strings.Split(line, "\t")
 
-	return strings.Split(parts[1], "/")[2], parts[0]
+	tag := strings.TrimRight(strings.Split(parts[1], "/")[2], "^{}")
+	rev := strings.Split(parts[0], "^")[0]
+
+	return tag, rev
 }
 
 func fetchLastCommit(repository, branch string) string {
